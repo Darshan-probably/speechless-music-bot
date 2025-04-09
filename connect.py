@@ -58,7 +58,6 @@ class WSNowPlayingClient:
                 # Wait before trying again
                 await asyncio.sleep(self.reconnect_interval)
     async def handle_command(self, data):
-    #Handle commands received from the web interface.
         try:
             command = json.loads(data)
             action = command.get("action")
@@ -211,125 +210,6 @@ class WSNowPlayingClient:
             traceback_str = traceback.format_exc()
             print(traceback_str)
 
-async def handle_search(self, query, bot, active_guild, active_player, active_channel):
-    """Handle search request from web interface."""
-    if not query:
-        return
-    
-    print(f"Searching for: {query}")
-    
-    try:
-        # If no active guild, can't proceed
-        if not active_guild:
-            print("No guild available for bot")
-            search_response = {
-                "type": "search_result",
-                "success": False,
-                "message": "Bot is not in any server"
-            }
-            await self.ws.send_str(json.dumps(search_response))
-            return
-        
-        # If no active player, try to join a voice channel
-        if not active_player:
-            # Find a suitable voice channel in the active guild
-            voice_channel = None
-            for channel in active_guild.voice_channels:
-                if channel.members:  # Join where people are
-                    voice_channel = channel
-                    break
-            
-            # If no channel with members, take the first one
-            if not voice_channel and active_guild.voice_channels:
-                voice_channel = active_guild.voice_channels[0]
-            
-            if voice_channel:
-                try:
-                    active_player = await voice_channel.connect(cls=wavelink.Player)
-                    print(f"Connected to voice channel: {voice_channel.name}")
-                except Exception as connect_error:
-                    print(f"Error connecting to voice channel: {connect_error}")
-                    search_response = {
-                        "type": "search_result",
-                        "success": False,
-                        "message": f"Error connecting to voice: {str(connect_error)}"
-                    }
-                    await self.ws.send_str(json.dumps(search_response))
-                    return
-            else:
-                print("No voice channels available in guild")
-                search_response = {
-                    "type": "search_result",
-                    "success": False,
-                    "message": "No voice channels available"
-                }
-                await self.ws.send_str(json.dumps(search_response))
-                return
-        
-        # Now search and play the track
-        tracks = await wavelink.Playable.search(query)
-        
-        if not tracks:
-            print("No tracks found")
-            search_response = {
-                "type": "search_result",
-                "success": False,
-                "message": "No tracks found"
-            }
-            await self.ws.send_str(json.dumps(search_response))
-            return
-        
-        track = tracks[0]  # Take the first result
-        
-        # If already playing, add to queue
-        if active_player.playing:
-            active_player.queue.put(track)
-            message = f"Added to queue: {track.title}"
-            print(message)
-            
-            # Update queue display
-            await self.send_queue_update(active_player)
-            
-            # Notify in Discord
-            if active_channel:
-                await active_channel.send(f"🎵 Added to queue: `{track.title}`")
-        else:
-            # Start playing
-            await active_player.play(track)
-            message = f"Now playing: {track.title}"
-            print(message)
-            
-            # Notify in Discord
-            if active_channel:
-                await active_channel.send(f"🎶 Now playing: `{track.title}`")
-        
-        # Send response to web interface
-        search_response = {
-            "type": "search_result",
-            "success": True,
-            "message": message,
-            "track": {
-                "title": track.title,
-                "artist": track.author,
-                "thumbnail": getattr(track, "artwork", None) or getattr(track, "thumbnail", None) or "https://i.imgur.com/opTLRNC.png",
-                "duration": int(track.length / 1000) if hasattr(track, 'length') else 0
-            }
-        }
-        await self.ws.send_str(json.dumps(search_response))
-        
-    except Exception as e:
-        print(f"Error in search handler: {e}")
-        import traceback
-        traceback_str = traceback.format_exc()
-        print(traceback_str)
-        
-        search_response = {
-            "type": "search_result",
-            "success": False,
-            "message": f"Error: {str(e)}"
-        }
-        await self.ws.send_str(json.dumps(search_response))
-    
     async def listen(self):
         """Listen for messages from the server."""
         try:
@@ -353,7 +233,8 @@ async def handle_search(self, query, bot, active_guild, active_player, active_ch
             self.session = None
             self.connected = False
             # Schedule reconnection
-            asyncio.create_task(self.connect())
+            asyncio.create_task(self.connect())            
+
 
     async def handle_search(self, query, bot, active_guild, active_player, active_channel):
         """Handle search request from web interface."""
@@ -542,3 +423,5 @@ async def handle_search(self, query, bot, active_guild, active_player, active_ch
             await self.session.close()
         self.connected = False
         print("WebSocket connection closed")
+
+
