@@ -5,6 +5,7 @@ import aiohttp
 import os
 from dotenv import load_dotenv
 import wavelink
+import traceback 
 
 # Load environment variables
 load_dotenv()
@@ -56,6 +57,278 @@ class WSNowPlayingClient:
                 
                 # Wait before trying again
                 await asyncio.sleep(self.reconnect_interval)
+    async def handle_command(self, data):
+    #Handle commands received from the web interface.
+        try:
+            command = json.loads(data)
+            action = command.get("action")
+            payload = command.get("payload", {})
+            bot = BOT_STATE.get("bot")
+            
+            if not bot:
+                print("Bot not initialized yet")
+                return
+            
+            print(f"Processing command: {action} with payload: {payload}")
+            
+            # Find active player and guild
+            active_player = None
+            active_guild = None
+            active_channel = None
+            
+            for guild in bot.guilds:
+                # Find a guild with an active voice client
+                if guild.voice_client and isinstance(guild.voice_client, wavelink.Player):
+                    active_player = guild.voice_client
+                    active_guild = guild
+                    active_channel = next((channel for channel in guild.text_channels), None)
+                    break
+            
+            # If no active guild found but we have guilds, use the first one
+            if not active_guild and bot.guilds:
+                active_guild = bot.guilds[0]
+                active_channel = next((channel for channel in active_guild.text_channels), None)
+            
+            # For "stop" command, we proceed even if no active_player
+            if action == "stop":
+                if active_player:
+                    await active_player.stop()
+                    await active_player.disconnect()
+                    print("Stopped playback and disconnected")
+                else:
+                    print("No active player to stop")
+                
+                # Update web interface that nothing is playing
+                await self.send_now_playing("No track playing")
+                
+                # Notify in Discord if channel is available
+                if active_channel:
+                    await active_channel.send("⏹️ Stopped playback and disconnected.")
+                
+                return
+            
+            # For search command, handle specially since we might need to connect
+            if action == "search":
+                await self.handle_search(query=payload.get("query"), 
+                                        bot=bot, 
+                                        active_guild=active_guild,
+                                        active_player=active_player,
+                                        active_channel=active_channel)
+                return
+            
+            # For other commands, we need an active player
+            if not active_player:
+                print(f"No active player found for command: {action}")
+                error_response = {
+                    "type": "command_response",
+                    "action": action,
+                    "success": False,
+                    "message": "Bot is not connected to a voice channel"
+                }
+                await self.ws.send_str(json.dumps(error_response))
+                return
+            
+            # Handle other commands
+            success = True
+            message = f"Command {action} executed"
+            
+            if action == "play_pause":
+                if active_player.is_playing():
+                    if active_player.is_paused():
+                        await active_player.resume()
+                        print("Resumed playback")
+                        message = "Resumed playback"
+                        if active_channel:
+                            await active_channel.send("▶️ Resumed playback.")
+                    else:
+                        await active_player.pause()
+                        print("Paused playback")
+                        message = "Paused playback"
+                        if active_channel:
+                            await active_channel.send("⏸️ Paused playback.")
+                else:
+                    success = False
+                    message = "Nothing is playing"
+            
+            elif action == "skip":
+                if active_player.is_playing():
+                    await active_player.stop()
+                    print("Skipped current track")
+                    message = "Skipped track"
+                    if active_channel:
+                        await active_channel.send("⏭️ Skipped current track.")
+                else:
+                    success = False
+                    message = "Nothing is playing"
+            
+            elif action == "previous":
+                # Previous track is not natively supported by wavelink
+                # Would need to keep track of history yourself
+                success = False
+                message = "Previous track function not implemented"
+                print("Previous track not implemented yet")
+            
+            elif action == "loop":
+                # Toggle loop mode
+                if hasattr(active_player, 'queue'):
+                    active_player.queue.loop = not getattr(active_player.queue, 'loop', False)
+                    loop_status = "enabled" if active_player.queue.loop else "disabled"
+                    message = f"Loop mode {loop_status}"
+                    print(f"Loop mode {loop_status}")
+                    if active_channel:
+                        await active_channel.send(f"🔄 Loop mode {loop_status}.")
+                else:
+                    success = False
+                    message = "Queue not available for looping"
+            
+            elif action == "shuffle":
+                if hasattr(active_player, 'queue') and active_player.queue:
+                    active_player.queue.shuffle()
+                    message = "Queue shuffled"
+                    print("Queue shuffled")
+                    if active_channel:
+                        await active_channel.send("🔀 Queue shuffled.")
+                    
+                    # Update the queue display
+                    await self.send_queue_update(active_player)
+                else:
+                    success = False
+                    message = "Queue empty or not available"
+            
+            # Send response back to web interface
+            response = {
+                "type": "command_response",
+                "action": action,
+                "success": success,
+                "message": message
+            }
+            await self.ws.send_str(json.dumps(response))
+            
+        except json.JSONDecodeError:
+            print(f"Failed to parse command: {data}")
+        except Exception as e:
+            print(f"Error handling command: {e}")
+            traceback_str = traceback.format_exc()
+            print(traceback_str)
+
+async def handle_search(self, query, bot, active_guild, active_player, active_channel):
+    """Handle search request from web interface."""
+    if not query:
+        return
+    
+    print(f"Searching for: {query}")
+    
+    try:
+        # If no active guild, can't proceed
+        if not active_guild:
+            print("No guild available for bot")
+            search_response = {
+                "type": "search_result",
+                "success": False,
+                "message": "Bot is not in any server"
+            }
+            await self.ws.send_str(json.dumps(search_response))
+            return
+        
+        # If no active player, try to join a voice channel
+        if not active_player:
+            # Find a suitable voice channel in the active guild
+            voice_channel = None
+            for channel in active_guild.voice_channels:
+                if channel.members:  # Join where people are
+                    voice_channel = channel
+                    break
+            
+            # If no channel with members, take the first one
+            if not voice_channel and active_guild.voice_channels:
+                voice_channel = active_guild.voice_channels[0]
+            
+            if voice_channel:
+                try:
+                    active_player = await voice_channel.connect(cls=wavelink.Player)
+                    print(f"Connected to voice channel: {voice_channel.name}")
+                except Exception as connect_error:
+                    print(f"Error connecting to voice channel: {connect_error}")
+                    search_response = {
+                        "type": "search_result",
+                        "success": False,
+                        "message": f"Error connecting to voice: {str(connect_error)}"
+                    }
+                    await self.ws.send_str(json.dumps(search_response))
+                    return
+            else:
+                print("No voice channels available in guild")
+                search_response = {
+                    "type": "search_result",
+                    "success": False,
+                    "message": "No voice channels available"
+                }
+                await self.ws.send_str(json.dumps(search_response))
+                return
+        
+        # Now search and play the track
+        tracks = await wavelink.Playable.search(query)
+        
+        if not tracks:
+            print("No tracks found")
+            search_response = {
+                "type": "search_result",
+                "success": False,
+                "message": "No tracks found"
+            }
+            await self.ws.send_str(json.dumps(search_response))
+            return
+        
+        track = tracks[0]  # Take the first result
+        
+        # If already playing, add to queue
+        if active_player.playing:
+            active_player.queue.put(track)
+            message = f"Added to queue: {track.title}"
+            print(message)
+            
+            # Update queue display
+            await self.send_queue_update(active_player)
+            
+            # Notify in Discord
+            if active_channel:
+                await active_channel.send(f"🎵 Added to queue: `{track.title}`")
+        else:
+            # Start playing
+            await active_player.play(track)
+            message = f"Now playing: {track.title}"
+            print(message)
+            
+            # Notify in Discord
+            if active_channel:
+                await active_channel.send(f"🎶 Now playing: `{track.title}`")
+        
+        # Send response to web interface
+        search_response = {
+            "type": "search_result",
+            "success": True,
+            "message": message,
+            "track": {
+                "title": track.title,
+                "artist": track.author,
+                "thumbnail": getattr(track, "artwork", None) or getattr(track, "thumbnail", None) or "https://i.imgur.com/opTLRNC.png",
+                "duration": int(track.length / 1000) if hasattr(track, 'length') else 0
+            }
+        }
+        await self.ws.send_str(json.dumps(search_response))
+        
+    except Exception as e:
+        print(f"Error in search handler: {e}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(traceback_str)
+        
+        search_response = {
+            "type": "search_result",
+            "success": False,
+            "message": f"Error: {str(e)}"
+        }
+        await self.ws.send_str(json.dumps(search_response))
     
     async def listen(self):
         """Listen for messages from the server."""
@@ -81,87 +354,125 @@ class WSNowPlayingClient:
             self.connected = False
             # Schedule reconnection
             asyncio.create_task(self.connect())
-    
-    async def handle_command(self, data):
-        """Handle commands received from the web interface."""
+
+    async def handle_search(self, query, bot, active_guild, active_player, active_channel):
+        """Handle search request from web interface."""
+        if not query:
+            return
+        
+        print(f"Searching for: {query}")
+        
         try:
-            command = json.loads(data)
-            action = command.get("action")
-            payload = command.get("payload", {})
-            bot = BOT_STATE.get("bot")
-            
-            if not bot:
-                print("Bot not initialized yet")
+            # If no active guild, can't proceed
+            if not active_guild:
+                print("No guild available for bot")
+                search_response = {
+                    "type": "search_result",
+                    "success": False,
+                    "message": "Bot is not in any server"
+                }
+                await self.ws.send_str(json.dumps(search_response))
                 return
             
-            print(f"Processing command: {action} with payload: {payload}")
+            # If no active player, try to join a voice channel
+            if not active_player:
+                # Find a suitable voice channel in the active guild
+                voice_channel = None
+                for channel in active_guild.voice_channels:
+                    if channel.members:  # Join where people are
+                        voice_channel = channel
+                        break
                 
-            # Find active voice client (assume only one per bot for now)
-            active_player = None
-            for guild in bot.guilds:
-                if guild.voice_client and isinstance(guild.voice_client, wavelink.Player):
-                    active_player = guild.voice_client
-                    break
-            
-            if action == "play_pause" and active_player:
-                # Toggle play/pause on the current player
-                if active_player.is_playing():
-                    if active_player.is_paused():
-                        await active_player.resume()
-                        print("Resumed playback")
-                    else:
-                        await active_player.pause()
-                        print("Paused playback")
-            
-            elif action == "skip" and active_player:
-                # Skip the current track
-                if active_player.is_playing():
-                    await active_player.stop()
-                    print("Skipped current track")
-            
-            elif action == "previous" and active_player:
-                # Previous track functionality would require track history
-                print("Previous track not implemented yet")
-            
-            elif action == "stop" and active_player:
-                # Stop playback and disconnect
-                await active_player.stop()
-                await active_player.disconnect()
-                print("Stopped playback and disconnected")
-                # Update web interface that nothing is playing
-                await self.send_now_playing("No track playing")
-            
-            elif action == "loop" and active_player:
-                # Toggle loop mode if queue is available
-                if hasattr(active_player, 'queue'):
-                    active_player.queue.loop = not getattr(active_player.queue, 'loop', False)
-                    loop_status = "enabled" if active_player.queue.loop else "disabled"
-                    print(f"Loop mode {loop_status}")
-            
-            elif action == "shuffle" and active_player:
-                # Shuffle the queue if available
-                if hasattr(active_player, 'queue') and len(active_player.queue) > 1:
-                    active_player.queue.shuffle()
-                    print("Queue shuffled")
-                    
-            elif action == "search":
-                # Handle search request
-                query = payload.get("query")
-                if query:
-                    print(f"Searching for: {query}")
-                    # Search functionality would be implemented here
-                    # For now, just acknowledge the search
+                # If no channel with members, take the first one
+                if not voice_channel and active_guild.voice_channels:
+                    voice_channel = active_guild.voice_channels[0]
+                
+                if voice_channel:
+                    try:
+                        active_player = await voice_channel.connect(cls=wavelink.Player)
+                        print(f"Connected to voice channel: {voice_channel.name}")
+                    except Exception as connect_error:
+                        print(f"Error connecting to voice channel: {connect_error}")
+                        search_response = {
+                            "type": "search_result",
+                            "success": False,
+                            "message": f"Error connecting to voice: {str(connect_error)}"
+                        }
+                        await self.ws.send_str(json.dumps(search_response))
+                        return
+                else:
+                    print("No voice channels available in guild")
                     search_response = {
                         "type": "search_result",
-                        "query": query,
-                        "results": ["Song would be searched here"]
+                        "success": False,
+                        "message": "No voice channels available"
                     }
                     await self.ws.send_str(json.dumps(search_response))
+                    return
             
-        except json.JSONDecodeError:
-            print(f"Failed to parse command: {data}")
+            # Now search and play the track
+            tracks = await wavelink.Playable.search(query)
+            
+            if not tracks:
+                print("No tracks found")
+                search_response = {
+                    "type": "search_result",
+                    "success": False,
+                    "message": "No tracks found"
+                }
+                await self.ws.send_str(json.dumps(search_response))
+                return
+            
+            track = tracks[0]  # Take the first result
+            
+            # If already playing, add to queue
+            if active_player.playing:
+                active_player.queue.put(track)
+                message = f"Added to queue: {track.title}"
+                print(message)
+                
+                # Update queue display
+                await self.send_queue_update(active_player)
+                
+                # Notify in Discord
+                if active_channel:
+                    await active_channel.send(f"🎵 Added to queue: `{track.title}`")
+            else:
+                # Start playing
+                await active_player.play(track)
+                message = f"Now playing: {track.title}"
+                print(message)
+                
+                # Notify in Discord
+                if active_channel:
+                    await active_channel.send(f"🎶 Now playing: `{track.title}`")
+            
+            # Send response to web interface
+            search_response = {
+                "type": "search_result",
+                "success": True,
+                "message": message,
+                "track": {
+                    "title": track.title,
+                    "artist": track.author,
+                    "thumbnail": getattr(track, "artwork", None) or getattr(track, "thumbnail", None) or "https://i.imgur.com/opTLRNC.png",
+                    "duration": int(track.length / 1000) if hasattr(track, 'length') else 0
+                }
+            }
+            await self.ws.send_str(json.dumps(search_response))
+            
         except Exception as e:
-            print(f"Error handling command: {e}")
+            print(f"Error in search handler: {e}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(traceback_str)
+            
+            search_response = {
+                "type": "search_result",
+                "success": False,
+                "message": f"Error: {str(e)}"
+            }
+            await self.ws.send_str(json.dumps(search_response))
     
     async def send_now_playing(self, track_info=None, track=None):
         """Send now playing information to the web interface."""
