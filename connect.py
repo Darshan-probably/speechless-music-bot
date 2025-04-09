@@ -57,6 +57,8 @@ class WSNowPlayingClient:
                 
                 # Wait before trying again
                 await asyncio.sleep(self.reconnect_interval)
+    
+    # In connect.py - Fix the handle_command method:
     async def handle_command(self, data):
         try:
             command = json.loads(data)
@@ -132,8 +134,9 @@ class WSNowPlayingClient:
             message = f"Command {action} executed"
             
             if action == "play_pause":
-                if active_player.is_playing():
-                    if active_player.is_paused():
+                # Fixed: Use .playing property instead of is_playing() method
+                if active_player.playing:
+                    if active_player.paused:  # Use paused property instead of is_paused()
                         await active_player.resume()
                         print("Resumed playback")
                         message = "Resumed playback"
@@ -150,7 +153,8 @@ class WSNowPlayingClient:
                     message = "Nothing is playing"
             
             elif action == "skip":
-                if active_player.is_playing():
+                # Fixed: Use .playing property instead of is_playing() method
+                if active_player.playing:
                     await active_player.stop()
                     print("Skipped current track")
                     message = "Skipped track"
@@ -159,6 +163,8 @@ class WSNowPlayingClient:
                 else:
                     success = False
                     message = "Nothing is playing"
+        
+        # Rest of the method remains the same...
             
             elif action == "previous":
                 # Previous track is not natively supported by wavelink
@@ -355,6 +361,7 @@ class WSNowPlayingClient:
             }
             await self.ws.send_str(json.dumps(search_response))
     
+    # In connect.py - Update the send_now_playing method to use a default image when the thumbnail URL fails:
     async def send_now_playing(self, track_info=None, track=None):
         """Send now playing information to the web interface."""
         if not self.connected:
@@ -364,11 +371,23 @@ class WSNowPlayingClient:
         # If a wavelink track object is provided, format it properly
         if track:
             # Format for wavelink v3
+            # Use a fallback thumbnail if the artwork URL might be problematic
+            thumbnail = None
+            try:
+                # Try to get artwork URL
+                thumbnail = getattr(track, "artwork", None) or getattr(track, "thumbnail", None)
+                # If we have a YouTube URL, modify it to avoid 403
+                if thumbnail and "ytimg.com" in thumbnail:
+                    # Use a public proxy or replace with default image
+                    thumbnail = "https://i.imgur.com/opTLRNC.png" 
+            except:
+                thumbnail = "https://i.imgur.com/opTLRNC.png"
+                
             message = {
                 "type": "now_playing",
                 "title": track.title,
                 "artist": track.author,
-                "thumbnail": getattr(track, "artwork", None) or getattr(track, "thumbnail", None) or "https://i.imgur.com/opTLRNC.png",
+                "thumbnail": thumbnail or "https://i.imgur.com/opTLRNC.png",
                 "duration": int(track.length / 1000) if hasattr(track, 'length') else 0,
                 "position": 0  # You'd need to track this separately
             }
