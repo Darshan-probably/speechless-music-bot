@@ -1,0 +1,5 @@
+discord.py 
+wavelink
+dotenv
+aiohttp
+traceback
