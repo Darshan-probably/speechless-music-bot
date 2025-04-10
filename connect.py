@@ -59,6 +59,7 @@ class WSNowPlayingClient:
                 await asyncio.sleep(self.reconnect_interval)
     
     # In connect.py - Fix the handle_command method:
+# In connect.py - Fix the handle_command method:
     async def handle_command(self, data):
         try:
             command = json.loads(data)
@@ -137,13 +138,13 @@ class WSNowPlayingClient:
                 # Fixed: Use .playing property instead of is_playing() method
                 if active_player.playing:
                     if active_player.paused:  # Use paused property instead of is_paused()
-                        await active_player.resume()
+                        await active_player.pause(False)  # False to resume
                         print("Resumed playback")
                         message = "Resumed playback"
                         if active_channel:
                             await active_channel.send("▶️ Resumed playback.")
                     else:
-                        await active_player.pause()
+                        await active_player.pause(True)  # True to pause
                         print("Paused playback")
                         message = "Paused playback"
                         if active_channel:
@@ -163,9 +164,7 @@ class WSNowPlayingClient:
                 else:
                     success = False
                     message = "Nothing is playing"
-        
-        # Rest of the method remains the same...
-            
+                    
             elif action == "previous":
                 # Previous track is not natively supported by wavelink
                 # Would need to keep track of history yourself
@@ -363,31 +362,21 @@ class WSNowPlayingClient:
     
     # In connect.py - Update the send_now_playing method to use a default image when the thumbnail URL fails:
     async def send_now_playing(self, track_info=None, track=None):
-        """Send now playing information to the web interface."""
         if not self.connected:
             print("Not connected to WebSocket server, can't send now playing info")
             return
             
+        # Always use Speechless.png for thumbnail
+        default_thumbnail = "/static/images/Speechless.png"
+            
         # If a wavelink track object is provided, format it properly
         if track:
             # Format for wavelink v3
-            # Use a fallback thumbnail if the artwork URL might be problematic
-            thumbnail = None
-            try:
-                # Try to get artwork URL
-                thumbnail = getattr(track, "artwork", None) or getattr(track, "thumbnail", None)
-                # If we have a YouTube URL, modify it to avoid 403
-                if thumbnail and "ytimg.com" in thumbnail:
-                    # Use a public proxy or replace with default image
-                    thumbnail = "https://i.imgur.com/opTLRNC.png" 
-            except:
-                thumbnail = "https://i.imgur.com/opTLRNC.png"
-                
             message = {
                 "type": "now_playing",
                 "title": track.title,
                 "artist": track.author,
-                "thumbnail": thumbnail or "https://i.imgur.com/opTLRNC.png",
+                "thumbnail": default_thumbnail,
                 "duration": int(track.length / 1000) if hasattr(track, 'length') else 0,
                 "position": 0  # You'd need to track this separately
             }
@@ -397,7 +386,7 @@ class WSNowPlayingClient:
                 "type": "now_playing",
                 "title": track_info or "No track playing",
                 "artist": "",
-                "thumbnail": "https://i.imgur.com/opTLRNC.png",
+                "thumbnail": default_thumbnail,
                 "duration": 0,
                 "position": 0
             }
@@ -411,7 +400,7 @@ class WSNowPlayingClient:
         except Exception as e:
             print(f"Failed to send now playing info: {e}")
             self.connected = False
-    
+
     async def send_queue_update(self, player=None):
         """Send queue information to the web interface."""
         if not self.connected:
