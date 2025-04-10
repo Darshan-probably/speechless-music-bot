@@ -81,6 +81,7 @@ async def play(ctx: commands.Context, *, search: str):
         # Send now playing update to the web interface
         await ws_client.send_now_playing(track=track)
 
+
 @bot.command()
 async def pause(ctx: commands.Context):
     """Pause or resume the current track."""
@@ -89,12 +90,12 @@ async def pause(ctx: commands.Context):
         return await ctx.send("Nothing is playing.")
         
     if player.is_paused():
-        await player.resume()
+        await player.pause(False)  # Fixed: False to resume
         await ctx.send("▶️ Resumed playback.")
     else:
-        await player.pause()
+        await player.pause(True)  # Fixed: True to pause
         await ctx.send("⏸️ Paused playback.")
-
+        
 @bot.command()
 async def skip(ctx: commands.Context):
     """Skip the current track."""
