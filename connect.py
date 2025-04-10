@@ -29,53 +29,122 @@ class WSNowPlayingClient:
         self.headers = {"x-api-token": API_SECRET}
         self.session = None
     
-    async def connect(self):
-        """Connect to the FastAPI WebSocket endpoint with a max of 5 attempts."""
-        attempt = 0
-        while attempt < 5:
+    async def start_heartbeat(self):
+        """Start sending periodic heartbeats to keep the connection alive."""
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self._heartbeat_task.add_done_callback(self._task_exception_handler)
+
+    async def _heartbeat_loop(self):
+        """Send periodic heartbeats to the server."""
+        while self.connected:
             try:
-                if not self.connected:
-                    print(f"Connecting to WebSocket server at {WS_URL} (Attempt {attempt + 1}/5)")
-                    # Create a new session if needed
-                    if self.session is None or self.session.closed:
-                        self.session = aiohttp.ClientSession()
-                    
-                    self.ws = await self.session.ws_connect(WS_URL, headers=self.headers)
-                    self.connected = True
-                    print("Connected to WebSocket server!")
-                    
-                    # Start the listener for incoming messages
-                    task = asyncio.create_task(self.listen())
-                    task.add_done_callback(self._task_exception_handler)
-                    return   # Successfully connected, exit the connect loop
+                if self.ws and not self.ws.closed:
+                    await self.ws.send_str(json.dumps({"type": "heartbeat"}))
+                    print("Heartbeat sent")
+                else:
+                    print("Cannot send heartbeat - connection closed")
+                    break
+            except Exception as e:
+                print(f"Error sending heartbeat: {e}")
+                break
+            
+            await asyncio.sleep(30)  # Send heartbeat every 30 seconds
+
+
+    def _task_exception_handler(self, task):
+        try:
+            # Get the result to trigger any exceptions
+            task.result()
+        except asyncio.CancelledError:
+            # Task was cancelled, no need to worry
+            pass
+        except Exception as e:
+            print(f"WebSocket task failed with error: {e}")
+            # If the connection fails, make sure we're properly marked as disconnected
+            self.connected = False
+            # Schedule reconnection if not already reconnecting
+            if not hasattr(self, '_reconnecting') or not self._reconnecting:
+                self._reconnecting = True
+                asyncio.create_task(self._delayed_reconnect())
+
+        async def _delayed_reconnect(self):
+            """Wait before attempting reconnection to avoid overwhelming the server."""
+            await asyncio.sleep(self.reconnect_interval)
+            self._reconnecting = False
+            # Only try to reconnect if we're still disconnected
+            if not self.connected:
+                await self.connect()
+
+    async def connect(self):
+        if self.ws:
+            await self.ws.close()
+            self.ws = None
+        
+        # Reset session if needed
+        if self.session and self.session.closed:
+            self.session = None
+        
+        attempt = 0
+        max_attempts = 5
+        
+        while attempt < max_attempts and not self.connected:
+            try:
+                print(f"Connecting to WebSocket server at {WS_URL} (Attempt {attempt + 1}/{max_attempts})")
+                # Create a new session if needed
+                if self.session is None:
+                    self.session = aiohttp.ClientSession()
+                
+                self.ws = await self.session.ws_connect(WS_URL, headers=self.headers)
+                self.connected = True
+                print("Connected to WebSocket server!")
+                
+                # Start the listener for incoming messages
+                task = asyncio.create_task(self.listen())
+                task.add_done_callback(self._task_exception_handler)
+                # Successfully connected, exit the connect loop
+                await self.start_heartbeat()
+                return
+                
             except Exception as e:
                 attempt += 1
-                print(f"Failed to connect to WebSocket on attempt {attempt}")
+                print(f"Failed to connect to WebSocket on attempt {attempt}: {e}")
                 self.connected = False
                 
-                # Close session if it exists and is open
-                if self.session and not self.session.closed:
-                    await self.session.close()
-                self.session = None
-
-                # Wait before trying again if we haven't reached the maximum attempts yet
-                if attempt < 5:
+                # Don't close the session after each attempt to avoid creating too many sessions
+                # Just clear the websocket connection
+                self.ws = None
+                
+                # Wait before trying again if we haven't reached max attempts
+                if attempt < max_attempts:
                     await asyncio.sleep(self.reconnect_interval)
         
         # Handle the case when maximum attempts have been reached
-        print("Unable to connect to the WebSocket server.")
-        # Optionally, raise an exception or perform other error handling here.
-        return
-    
-    # In connect.py - Fix the handle_command method:
-# In connect.py - Fix the handle_command method:
+        print("Unable to connect to the WebSocket server after maximum attempts.")
+        # Close the session on failure
+        if self.session and not self.session.closed:
+            await self.session.close()
+            self.session = None
+ 
     async def handle_command(self, data):
         try:
             command = json.loads(data)
             action = command.get("action")
+            
+            # If it's a heartbeat acknowledgment, just log it
+            if command.get("type") == "heartbeat_ack":
+                return
+                
             payload = command.get("payload", {})
             bot = BOT_STATE.get("bot")
 
+            # Skip processing if no action is specified
+            if not action:
+                print("Received message with no action, ignoring")
+                return
+                
+            print(f"Processing command: {action} with payload: {payload}")
+            
+            # Rest of your existing code...
             if not bot:
                 print("Bot not initialized yet")
                 return
@@ -248,6 +317,26 @@ class WSNowPlayingClient:
             self.connected = False
             # Schedule reconnection
             asyncio.create_task(self.connect())            
+
+    async def close(self):
+        """Close the WebSocket connection and clean up."""
+        self.connected = False  # Mark as disconnected first to prevent reconnection attempts
+        
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception as e:
+                print(f"Error closing WebSocket: {e}")
+            self.ws = None
+            
+        if self.session and not self.session.closed:
+            try:
+                await self.session.close()
+            except Exception as e:
+                print(f"Error closing session: {e}")
+            self.session = None
+            
+        print("WebSocket connection closed")
 
 
     async def handle_search(self, query, bot, active_guild, active_player, active_channel):
