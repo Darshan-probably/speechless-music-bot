@@ -10,8 +10,8 @@ import traceback
 # Load environment variables
 load_dotenv()
 API_SECRET = os.getenv("API_SECRET")
-WS_URL = os.getenv("WS_URL", "ws://127.0.0.1:8000/ws/nowplaying")
-
+WS_IP = os.getenv("WS_IP")
+WS_URL = f"wss://{WS_IP}/ws/nowplaying"
 # Shared state between modules
 BOT_STATE = {
     "bot": None,  # Will store the bot instance
