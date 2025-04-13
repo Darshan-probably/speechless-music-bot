@@ -1,191 +1,298 @@
-# main.py
-import discord
-from discord.ext import commands
-import wavelink
-import os
+import aiohttp
 import asyncio
+import json
+import os
+import time
+import traceback
+import wavelink
+from typing import Optional, Dict, Any
 from dotenv import load_dotenv
-from lavalink import connect_lavalink
-from connect import WSNowPlayingClient, BOT_STATE
-
 load_dotenv()
-token = os.getenv("Token")
 
-# Define the allowed connection sources
-ALLOWED_WS_SOURCES = [
-    "100.20.92.101",
-    "44.225.181.72", 
-    "44.227.217.144",
-    "cloudflare-website.onrender.com"
-]
+# Global state to share between modules
+BOT_STATE = {
+    "bot": None  # Will be set to the bot instance in on_ready
+}
 
-# Set default WS_IP if not provided in .env
-if not os.getenv("WS_IP"):
-    print("WS_IP not found in .env, using the first allowed source as default")
-    os.environ["WS_IP"] = ALLOWED_WS_SOURCES[0]
-
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
-
-# Initialize the WS client
-ws_client = WSNowPlayingClient()
-def ws_task_callback(task: asyncio.Task):
-    try:
-        # Try to retrieve the result to trigger exceptions, if any.
-        task.result()
-    except Exception as e:
-        # Print a clean error message without a full traceback.
-        print(f"WebSocket connection task ended: {e}")
-
-
-@bot.event
-async def on_ready():
-    print(f'Bot ready: {bot.user}')
-    await connect_lavalink(bot)
-    # Set the bot instance in the shared state
-    BOT_STATE["bot"] = bot
-    # Start the WebSocket connection
-    bot.loop.create_task(ws_client.connect())
-    print("WebSocket client initialized")
-
-@bot.event
-async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload) -> None:
-    """Event fired when a track starts playing."""
-    player = payload.player
-    track = payload.track
+class WSNowPlayingClient:
+    """Client for sending updates to the web interface via WebSocket"""
     
-    # Send now playing update to the web interface
-    await ws_client.send_now_playing(track=track)
-    
-    # Also update queue information
-    await ws_client.send_queue_update(player)
-
-@bot.event
-async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload) -> None:
-    """Event fired when a track ends."""
-    player = payload.player
-    
-    # If queue is empty and no next track, update status
-    if not player.queue and payload.reason == 'FINISHED':
-        await asyncio.sleep(1)  # Wait a bit to see if a new track starts
-        if not player.playing:
-            await ws_client.send_now_playing("No track playing")
-
-@bot.command()
-async def play(ctx: commands.Context, *, search: str):
-    """Play a track from search query."""
-    if not ctx.author.voice or not ctx.author.voice.channel:
-        return await ctx.send("You must be in a voice channel to play music.")
-    
-    channel = ctx.author.voice.channel
-    # Connect to voice if not already
-    player: wavelink.Player = ctx.voice_client or await channel.connect(cls=wavelink.Player)
-    
-    # Search for tracks
-    tracks = await wavelink.Playable.search(search)
-    if not tracks:
-        return await ctx.send("No tracks found.")
-    
-    track = tracks[0]
-    await player.set_volume(100)
-    
-    # If already playing, add to queue
-    if player.playing:
-        player.queue.put(track)
-        await ctx.send(f"🎵 Added to queue: `{track.title}`")
-        # Update the queue on the web interface
-        await ws_client.send_queue_update(player)
-    else:
-        await player.play(track)
-        await ctx.send(f"🎶 Now playing: `{track.title}`")
-        # Send now playing update to the web interface
-        await ws_client.send_now_playing(track=track)
-
-
-@bot.command()
-async def pause(ctx: commands.Context):
-    """Pause or resume the current track."""
-    player: wavelink.Player = ctx.voice_client
-    if not player:
-        return await ctx.send("Nothing is playing.")
+    def __init__(self):
+        self.ws = None
+        self.connected = False
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 5
+        self.last_heartbeat = 0
+        self.heartbeat_interval = 30  # seconds
+        self.ws_url = None
+        self.ws_ip = os.getenv("WS_IP")
         
-    if player.is_paused():
-        await player.pause(False)  # Fixed: False to resume
-        await ctx.send("▶️ Resumed playback.")
-    else:
-        await player.pause(True)  # Fixed: True to pause
-        await ctx.send("⏸️ Paused playback.")
+        # Define allowed sources
+        self.allowed_sources = [
+            "100.20.92.101",
+            "44.225.181.72", 
+            "44.227.217.144",
+            "cloudflare-website.onrender.com"
+        ]
         
-@bot.command()
-async def skip(ctx: commands.Context):
-    """Skip the current track."""
-    player: wavelink.Player = ctx.voice_client
-    if not player:
-        return await ctx.send("Nothing is playing.")
+        # Validate the WS_IP from env
+        if not self.ws_ip or self.ws_ip not in self.allowed_sources:
+            self.ws_ip = self.allowed_sources[0]  # Use default if invalid
+            
+    async def connect(self):
+        """Connect to the WebSocket server with retry logic"""
+        self.reconnect_attempts = 0
+        await self._attempt_connection()
         
-    await player.stop()
-    await ctx.send("⏭️ Skipped current track.")
-
-@bot.command()
-async def loop(ctx: commands.Context):
-    """Toggle loop mode for the queue."""
-    player: wavelink.Player = ctx.voice_client
-    if not player:
-        return await ctx.send("Nothing is playing.")
-    
-    # Toggle loop mode
-    player.queue.loop = not getattr(player.queue, 'loop', False)
-    loop_status = "enabled" if player.queue.loop else "disabled"
-    await ctx.send(f"🔄 Loop mode {loop_status}.")
-
-@bot.command()
-async def shuffle(ctx: commands.Context):
-    """Shuffle the current queue."""
-    player: wavelink.Player = ctx.voice_client
-    if not player or len(player.queue) < 2:
-        return await ctx.send("Not enough songs in queue to shuffle.")
-    
-    player.queue.shuffle()
-    await ctx.send("🔀 Queue shuffled.")
-    # Update the queue on the web interface
-    await ws_client.send_queue_update(player)
-
-@bot.command()
-async def queue(ctx: commands.Context):
-    """Show the current queue."""
-    player: wavelink.Player = ctx.voice_client
-    if not player or not player.queue:
-        return await ctx.send("The queue is empty.")
-    
-    upcoming = list(player.queue)
-    queue_list = "\n".join(f"{i+1}. {track.title}" for i, track in enumerate(upcoming[:10]))
-    
-    if len(upcoming) > 10:
-        queue_list += f"\n...and {len(upcoming) - 10} more."
-    
-    await ctx.send(f"**Current Queue:**\n{queue_list}")
-
-@bot.command()
-async def stop(ctx: commands.Context):
-    """Stop playback and disconnect."""
-    player: wavelink.Player = ctx.voice_client
-    if not player:
-        return await ctx.send("Bot not connected.")
-    
-    await player.stop()
-    await player.disconnect()
-    await ctx.send("Disconnected.")
-    
-    # Update web interface that nothing is playing
-    await ws_client.send_now_playing("No track playing")
-
-# Add a cleanup handler for the WebSocket client
-@bot.event
-async def on_close():
-    """Clean up resources when the bot is shutting down."""
-    await ws_client.close()
-
-# Run your bot
-if __name__ == "__main__":
-    bot.run(token)
+    async def _attempt_connection(self):
+        """Try to connect to the WebSocket server"""
+        if self.reconnect_attempts >= self.max_reconnect_attempts:
+            print(f"Max reconnection attempts ({self.max_reconnect_attempts}) reached. Giving up.")
+            return
+            
+        self.reconnect_attempts += 1
+        
+        # Determine if it's an IP or domain
+        if self.ws_ip in self.allowed_sources and not self.ws_ip.replace('.', '').isdigit():
+            # It's a domain name
+            source_desc = f"Domain: {self.ws_ip}"
+            # Use secure WebSocket for domain names
+            self.ws_url = f"wss://{self.ws_ip}/ws/nowplaying"
+        else:
+            # It's an IP address
+            source_desc = f"IP: {self.ws_ip}"
+            # Use regular WebSocket for IP addresses
+            self.ws_url = f"ws://{self.ws_ip}/ws/nowplaying"
+            
+        print(f"Connecting to WebSocket server at {self.ws_url} ({source_desc}) (Attempt {self.reconnect_attempts}/{self.max_reconnect_attempts})")
+        
+        try:
+            # Use API secret for authentication
+            headers = {"x-api-token": os.getenv("API_SECRET", "")}
+            
+            # Create session and connect
+            session = aiohttp.ClientSession()
+            self.ws = await session.ws_connect(self.ws_url, headers=headers, timeout=30)
+            
+            self.connected = True
+            print(f"Connected to WebSocket server! Source: {source_desc}")
+            
+            # Start the receive loop and heartbeat
+            asyncio.create_task(self._receive_loop(source_desc))
+            asyncio.create_task(self._heartbeat_loop(source_desc))
+            
+        except Exception as e:
+            print(f"Failed to connect to WebSocket server: {e}")
+            # Wait before retrying
+            await asyncio.sleep(5)
+            # Retry connection
+            asyncio.create_task(self._attempt_connection())
+            
+    async def _receive_loop(self, source_desc: str):
+        """Continuously receive messages from the WebSocket"""
+        if not self.ws:
+            return
+            
+        print(f"Listening for messages from {source_desc}")
+        
+        try:
+            async for msg in self.ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                        print(f"Received message from {source_desc}: {data}")
+                        
+                        # Process commands from web interface
+                        if data.get("action") == "status_request":
+                            # Send current status
+                            await self._send_status_response()
+                            
+                    except json.JSONDecodeError:
+                        print(f"Received invalid JSON from {source_desc}")
+                    except Exception as e:
+                        print(f"Error processing message from {source_desc}: {e}")
+                        
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    print(f"WebSocket connection error: {msg.data}")
+                    break
+                    
+        except Exception as e:
+            print(f"Error in receive loop: {e}")
+            
+        finally:
+            self.connected = False
+            # Try to reconnect after connection is closed
+            await asyncio.sleep(5)
+            asyncio.create_task(self._attempt_connection())
+            
+    async def _heartbeat_loop(self, source_desc: str):
+        """Send periodic heartbeats to keep the connection alive"""
+        while self.connected and self.ws:
+            try:
+                # Send a heartbeat message
+                await self.ws.send_json({"type": "heartbeat"})
+                print(f"Heartbeat sent to {source_desc}")
+                self.last_heartbeat = time.time()
+                
+                # Wait for the next interval
+                await asyncio.sleep(self.heartbeat_interval)
+                
+            except Exception as e:
+                print(f"Error sending heartbeat: {e}")
+                # If we can't send heartbeats, the connection might be dead
+                self.connected = False
+                break
+                
+    async def _send_status_response(self):
+        """Send a response to a status request"""
+        try:
+            # Get the current player state
+            bot = BOT_STATE.get("bot")
+            if not bot:
+                print("Bot not available for status")
+                return
+                
+            # Get the first voice client as our player
+            player = None
+            for voice_client in bot.voice_clients:
+                if isinstance(voice_client, wavelink.Player):
+                    player = voice_client
+                    break
+                    
+            # Prepare response data
+            if player and player.playing:
+                track = player.current
+                track_info = {
+                    "title": track.title,
+                    "artist": track.author,
+                    "duration": track.length / 1000,  # Convert to seconds
+                    "thumbnail": "static/images/Speechless.png",  # Use default image
+                    "position": player.position / 1000  # Convert to seconds
+                }
+                
+                # Also include queue information
+                queue = []
+                if player.queue:
+                    for idx, track in enumerate(list(player.queue)[:10]):
+                        queue.append({
+                            "title": track.title,
+                            "artist": track.author,
+                            "duration": track.length / 1000
+                        })
+                        
+                # Send response
+                await self.send_now_playing(track=track)
+                await self.send_queue_update(player)
+                
+                # Send command response
+                await self.ws.send_json({
+                    "type": "command_response",
+                    "action": "status_request",
+                    "success": True,
+                    "message": "Command status request processed"
+                })
+            else:
+                # No track playing
+                await self.send_now_playing("No track playing")
+                await self.send_queue_update(None)
+                
+                # Send command response
+                await self.ws.send_json({
+                    "type": "command_response",
+                    "action": "status_request",
+                    "success": True,
+                    "message": "Command status request processed - No track playing"
+                })
+                
+        except Exception as e:
+            print(f"Error sending status response: {str(e)}")
+            # Try to send error response
+            try:
+                if self.ws:
+                    await self.ws.send_json({
+                        "type": "command_response",
+                        "action": "status_request",
+                        "success": False,
+                        "message": f"Error processing status request: {str(e)}"
+                    })
+            except:
+                pass
+                
+    async def send_now_playing(self, track=None):
+        """Send now playing information to the web interface"""
+        if not self.connected or not self.ws:
+            return
+            
+        try:
+            if isinstance(track, str):
+                # Handle "No track playing" case
+                message = {
+                    "type": "now_playing",
+                    "title": track,
+                    "artist": "",
+                    "duration": 0,
+                    "thumbnail": "static/images/Speechless.png"
+                }
+            elif track:
+                # Handle track object
+                message = {
+                    "type": "now_playing",
+                    "title": track.title,
+                    "artist": track.author,
+                    "duration": track.length / 1000,  # Convert to seconds
+                    "thumbnail": "static/images/Speechless.png"  # Use default image
+                }
+            else:
+                # Empty state
+                message = {
+                    "type": "now_playing",
+                    "title": "No track playing",
+                    "artist": "",
+                    "duration": 0,
+                    "thumbnail": "static/images/Speechless.png"
+                }
+                
+            # Send the message
+            await self.ws.send_json(message)
+            print(f"Sent now playing update: {message['title']}")
+            
+        except Exception as e:
+            print(f"Error sending now playing update: {e}")
+            self.connected = False
+            
+    async def send_queue_update(self, player):
+        """Send queue information to the web interface"""
+        if not self.connected or not self.ws:
+            return
+            
+        try:
+            queue = []
+            if player and player.queue:
+                # Convert queue items to simplified dicts
+                for track in list(player.queue)[:10]:  # Only send first 10 items
+                    queue.append({
+                        "title": track.title,
+                        "artist": track.author,
+                        "duration": track.length / 1000  # Convert to seconds
+                    })
+                    
+            # Create the message
+            message = {
+                "type": "queue_update",
+                "queue": queue
+            }
+            
+            # Send the update
+            await self.ws.send_json(message)
+            print(f"Sent queue update with {len(queue)} items")
+            
+        except Exception as e:
+            print(f"Error sending queue update: {e}")
+            self.connected = False
+            
+    async def close(self):
+        """Close the WebSocket connection cleanly"""
+        if self.ws:
+            await self.ws.close()
+            self.connected = False
+            print("WebSocket connection closed")
