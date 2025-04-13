@@ -11,19 +11,6 @@ from connect import WSNowPlayingClient, BOT_STATE
 load_dotenv()
 token = os.getenv("Token")
 
-# Define the allowed connection sources
-ALLOWED_WS_SOURCES = [
-    "100.20.92.101",
-    "44.225.181.72", 
-    "44.227.217.144",
-    "cloudflare-website.onrender.com"
-]
-
-# Set default WS_IP if not provided in .env
-if not os.getenv("WS_IP"):
-    print("WS_IP not found in .env, using the first allowed source as default")
-    os.environ["WS_IP"] = ALLOWED_WS_SOURCES[0]
-
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
